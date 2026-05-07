@@ -1,199 +1,122 @@
-"""
-RAG Pipeline
-============
-Orchestrates semantic retrieval + grounded generation:
-
-  Query → Embed → ChromaDB similarity search → top-K docs
-       → Inject into prompt → deepseek-coder-v2:16b → answer + sources
-
-ARCHITECTURAL DECISION — Why RAG over fine-tuning?
-  Fine-tuning permanently bakes knowledge into model weights. For company
-  policies this is problematic:
-    • Policies change (leave days, WFH rules) — retraining is expensive.
-    • Fine-tuned models hallucinate confidently on out-of-distribution queries.
-    • You can't audit which training document produced an answer.
-  RAG solves all three:
-    • Update policy → re-ingest PDF → instantly reflected in answers.
-    • Answers are grounded in retrieved text, not hallucinated weights.
-    • Every response cites exact source documents for auditability.
-
-ARCHITECTURAL DECISION — How semantic retrieval works:
-  1. User query is embedded using the same model as ingestion (nomic-embed-text).
-  2. ChromaDB performs approximate nearest-neighbour search (HNSW index) in
-     768-dim embedding space to find the top-K most semantically similar chunks.
-  3. "Semantic" means conceptually related text ranks high even with zero
-     keyword overlap — e.g. "days off" retrieves "annual leave entitlement".
-
-ARCHITECTURAL DECISION — How source grounding prevents hallucinations:
-  The prompt template hard-constrains the LLM:
-    "Answer ONLY using the context below. If not found, say so."
-  Combined with the retrieved chunks injected into the prompt, the model has
-  no reason to invent facts. Source file names are returned alongside the
-  answer so users can verify claims against the original documents.
-"""
-
 from typing import Tuple, List
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-from langchain.callbacks.manager import CallbackManagerForChainRun
+import os
+import chromadb
+import google.generativeai as genai
 
-from utils import get_settings, get_logger
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from utils import get_logger, get_settings
+
+load_dotenv()
 
 logger = get_logger(__name__)
 settings = get_settings()
 
-# ── Prompt Engineering ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a helpful HR assistant for an organisation. Your job is to answer employee questions based ONLY on the company policy documents provided below.
+SYSTEM_PROMPT = """
+You are a helpful HR assistant.
 
-Rules you must follow:
-1. Answer ONLY from the provided context. Do not use external knowledge.
-2. If the context does not contain enough information to answer, respond exactly:
-   "I don't have that information in the company documents."
-3. Be concise, clear, and professional.
-4. If the answer spans multiple policies, mention each source explicitly.
-5. Never make up numbers, dates, or entitlements.
+Answer ONLY using the context below.
 
-Context from company policy documents:
------------------------------------------
+If the answer is not found in the context, say:
+"I don't have that information in the company documents."
+
+Context:
 {context}
------------------------------------------
 
-Employee Question: {question}
+Question:
+{question}
 
-Answer:"""
-
-RAG_PROMPT = PromptTemplate(
-    template=SYSTEM_PROMPT,
-    input_variables=["context", "question"],
-)
+Answer:
+"""
 
 
-def _build_retriever(embeddings: OllamaEmbeddings):
-    """
-    Build a ChromaDB-backed retriever with MMR (Maximal Marginal Relevance).
-
-    MMR diversifies the top-K results — instead of returning 4 near-identical
-    chunks from the same paragraph, it balances relevance AND diversity so the
-    LLM sees broader context across the document.
-    """
-    vectorstore = Chroma(
-        collection_name=settings.chroma_collection_name,
-        embedding_function=embeddings,
-        persist_directory=settings.chroma_persist_dir,
-    )
-    return vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k": settings.top_k,
-            "fetch_k": settings.top_k * 3,  # fetch 3x, then MMR-select top_k
-        },
-    )
-
-
-def build_rag_chain():
-    """
-    Assemble the full RAG chain:
-      Retriever → PromptTemplate → LLM → Output
-
-    RetrievalQA with return_source_documents=True ensures source metadata
-    (filename, page number) is returned alongside the answer — essential
-    for the source citation UI.
-    """
-    embeddings = OllamaEmbeddings(
-        model=settings.embedding_model,
-        base_url=settings.ollama_base_url,
-    )
-
-    # Detect provider from model name (e.g., "gemini-1.5-flash#gemini")
-    model_name = settings.llm_model
-    if "#" in model_name:
-        base_model, provider = model_name.split("#", 1)
-        if provider.lower() == "gemini":
-            logger.info(f"Using Gemini model: {base_model}")
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            llm = ChatGoogleGenerativeAI(
-                model=base_model,
-                google_api_key=settings.gemini_api_key,
-                temperature=0.1,
-                max_output_tokens=1024,
-            )
-        else:
-            # Fallback to Ollama if unknown provider
-            llm = Ollama(
-                model=base_model,
-                base_url=settings.ollama_base_url,
-                temperature=0.1,
-                num_predict=1024,
-                top_k=10,
-                top_p=0.9,
-            )
-    else:
-        llm = Ollama(
-            model=model_name,
-            base_url=settings.ollama_base_url,
-            temperature=0.1,
-            num_predict=1024,
-            top_k=10,
-            top_p=0.9,
-        )
-
-    retriever = _build_retriever(embeddings)
-
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",           # "stuff" = inject all chunks into one prompt
-        retriever=retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": RAG_PROMPT},
-    )
-
-    return chain
-
-
-def extract_sources(source_documents: list) -> List[str]:
-    """
-    Deduplicate and normalise source file names from retrieved documents.
-    Returns a clean list like: ["Leave Policy.pdf", "HR Policy.pdf"]
-    """
+def extract_sources(metadatas) -> List[str]:
     seen = set()
     sources = []
-    for doc in source_documents:
-        src = doc.metadata.get("source", "Unknown Source")
-        if src not in seen:
-            seen.add(src)
-            sources.append(src)
+    for meta in metadatas:
+        source = meta.get("source", "Unknown Source")
+        if source not in seen:
+            seen.add(source)
+            sources.append(source)
     return sources
 
 
+_gemini_model = None
+_embedding_model = None
+_collection = None
+
+
+def _get_gemini_model():
+    global _gemini_model
+    if _gemini_model is None:
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set in .env")
+        if not settings.gemini_model:
+            raise RuntimeError("GEMINI_MODEL is not set in .env")
+
+        genai.configure(api_key=settings.gemini_api_key)
+        _gemini_model = genai.GenerativeModel(settings.gemini_model)
+        logger.info(f"Gemini model loaded: {settings.gemini_model}")
+
+    return _gemini_model
+
+
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        model_name = settings.embedding_model  # ← was hardcoded, now from settings
+        _embedding_model = SentenceTransformer(model_name)
+        logger.info(f"Embedding model loaded: {model_name}")
+    return _embedding_model
+
+
+def _get_collection():
+    global _collection
+    if _collection is None:
+        if not settings.chroma_persist_dir:
+            raise RuntimeError("CHROMA_PERSIST_DIR is not set in .env")
+        if not settings.chroma_collection_name:
+            raise RuntimeError("CHROMA_COLLECTION_NAME is not set in .env")
+
+        client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+        _collection = client.get_collection(settings.chroma_collection_name)
+        logger.info(f"ChromaDB collection loaded: {settings.chroma_collection_name}")
+
+    return _collection
+
+
 def query_rag(question: str) -> Tuple[str, List[str]]:
-    """
-    Main entry point for the /api/chat endpoint.
-
-    Args:
-        question: The employee's natural-language question.
-
-    Returns:
-        (answer, sources) — answer string and list of source file names.
-
-    Raises:
-        RuntimeError: If the vectorstore is empty or Ollama is unreachable.
-    """
-    logger.info(f"RAG query: {question!r}")
+    logger.info(f"Query: {question}")
 
     try:
-        chain = build_rag_chain()
-        result = chain.invoke({"query": question})
+        collection = _get_collection()
+        model = _get_gemini_model()
+        embedding_model = _get_embedding_model()
 
-        answer = result.get("result", "").strip()
-        source_docs = result.get("source_documents", [])
-        sources = extract_sources(source_docs)
+        query_embedding = embedding_model.encode(question).tolist()
 
-        logger.info(f"Answer generated. Sources: {sources}")
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=settings.top_k,  # ← was hardcoded 4, now from settings
+        )
+
+        retrieved_docs = results["documents"][0]
+        retrieved_metadata = results["metadatas"][0]
+
+        print("\n===== RETRIEVED CHUNKS =====")
+        for i, chunk in enumerate(retrieved_docs):
+            print(f"\nChunk {i + 1}:\n{chunk}\n{'=' * 50}")
+
+        context = "\n\n".join(retrieved_docs)
+        prompt = SYSTEM_PROMPT.format(context=context, question=question)
+
+        response = model.generate_content(prompt)
+        answer = response.text
+        sources = extract_sources(retrieved_metadata)
+
+        logger.info(f"Sources: {sources}")
         return answer, sources
 
     except Exception as exc:
-        logger.error(f"RAG pipeline failed: {exc}")
+        logger.error(f"RAG Error: {exc}")
         raise RuntimeError(f"RAG pipeline error: {str(exc)}") from exc

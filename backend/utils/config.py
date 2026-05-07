@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-coder-v2:16b"
     embedding_model: str = "nomic-embed-text"
     ollama_base_url: str = "http://localhost:11434"
+    gemini_api_key: str = ""
     
     # RAG Settings
     chunk_size: int = 500

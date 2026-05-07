@@ -107,14 +107,38 @@ def build_rag_chain():
         base_url=settings.ollama_base_url,
     )
 
-    llm = Ollama(
-        model=settings.llm_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.1,      # low temperature = deterministic, factual answers
-        num_predict=1024,     # max tokens for the answer
-        top_k=10,
-        top_p=0.9,
-    )
+    # Detect provider from model name (e.g., "gemini-1.5-flash#gemini")
+    model_name = settings.llm_model
+    if "#" in model_name:
+        base_model, provider = model_name.split("#", 1)
+        if provider.lower() == "gemini":
+            logger.info(f"Using Gemini model: {base_model}")
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model=base_model,
+                google_api_key=settings.gemini_api_key,
+                temperature=0.1,
+                max_output_tokens=1024,
+            )
+        else:
+            # Fallback to Ollama if unknown provider
+            llm = Ollama(
+                model=base_model,
+                base_url=settings.ollama_base_url,
+                temperature=0.1,
+                num_predict=1024,
+                top_k=10,
+                top_p=0.9,
+            )
+    else:
+        llm = Ollama(
+            model=model_name,
+            base_url=settings.ollama_base_url,
+            temperature=0.1,
+            num_predict=1024,
+            top_k=10,
+            top_p=0.9,
+        )
 
     retriever = _build_retriever(embeddings)
 

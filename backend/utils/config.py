@@ -7,16 +7,10 @@ class Settings(BaseSettings):
     # API
     allowed_origins: str = "http://localhost:3000,http://localhost:5173"
 
-    # Gemini
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
-
-    # Embedding — must match what was used during ingest
-    embedding_model: str = "all-mpnet-base-v2"  # ← was "nomic-embed-text", wrong
-
-    # Ollama (kept for reference, not used when running Gemini stack)
+    # Ollama (Local Model)
     llm_model: str = "deepseek-coder-v2:16b"
     ollama_base_url: str = "http://localhost:11434"
+    embedding_model: str = "nomic-embed-text"
 
     # RAG
     chunk_size: int = 500
